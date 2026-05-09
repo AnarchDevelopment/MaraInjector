@@ -81,10 +81,10 @@ int performInjection(DWORD procId, const wchar_t* dllPath) {
 
 int main(int argc, char* argv[]) {
     // Set console title
-    SetConsoleTitleA("MaraInjector - Fate Logic");
+    SetConsoleTitleA("MaraInjector");
 
     if (argc != 3) {
-        std::cout << "MaraInjector - Based on FateInjector logic" << std::endl;
+        std::cout << "MaraInjector" << std::endl;
         std::cout << "usage: mara.exe {process} {path-to-dll}" << std::endl;
         return 1;
     }
