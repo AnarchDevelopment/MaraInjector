@@ -1,27 +1,29 @@
+#define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <TlHelp32.h>
+#include <shellapi.h>
 #include <iostream>
 #include <string>
 #include <vector>
 
-DWORD GetProcId(const char* procName) {
+DWORD GetProcId(const char *procName)
+{
     DWORD procId = 0;
     HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
 
-    if (hSnap != INVALID_HANDLE_VALUE) {
+    if (hSnap != INVALID_HANDLE_VALUE)
+    {
         PROCESSENTRY32 procEntry;
         procEntry.dwSize = sizeof(procEntry);
 
-        if (Process32First(hSnap, &procEntry)) {
-            do {
-                char output[MAX_PATH];
-#ifdef UNICODE
-                // Convert WCHAR to char for comparison with procName (which is char*)
-                WideCharToMultiByte(CP_ACP, 0, procEntry.szExeFile, -1, output, MAX_PATH, NULL, NULL);
-#else
-                strcpy_s(output, procEntry.szExeFile);
-#endif
-                if (_stricmp(output, procName) == 0) {
+        if (Process32First(hSnap, &procEntry))
+        {
+            do
+            {
+                char output[256] = "error"; // convert wchar* to char*
+                sprintf(output, "%ws", procEntry.szExeFile);
+                if (!_stricmp(output, procName))
+                {
                     procId = procEntry.th32ProcessID;
                     break;
                 }
@@ -32,56 +34,80 @@ DWORD GetProcId(const char* procName) {
     return procId;
 }
 
-int performInjection(DWORD procId, const wchar_t* dllPath) {
+int performInjection(DWORD procId, const wchar_t *dllPath)
+{
     HANDLE hProc = OpenProcess(PROCESS_ALL_ACCESS, 0, procId);
 
-    if (hProc && hProc != INVALID_HANDLE_VALUE) {
-        // Allocate memory for the DLL path in the target process
-        size_t pathLen = (wcslen(dllPath) + 1) * sizeof(wchar_t);
-        void* loc = VirtualAllocEx(hProc, 0, pathLen, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-        
-        if (!loc) {
-            std::cerr << "Error: Failed to allocate memory in target process (Error: " << GetLastError() << ")" << std::endl;
-            CloseHandle(hProc);
-            return 1;
-        }
+    if (hProc && hProc != INVALID_HANDLE_VALUE)
+    {
+        void *loc = VirtualAllocEx(hProc, 0, MAX_PATH, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
 
-        // Write the DLL path to the allocated memory
-        if (!WriteProcessMemory(hProc, loc, dllPath, pathLen, 0)) {
-            std::cerr << "Error: Failed to write memory in target process (Error: " << GetLastError() << ")" << std::endl;
-            VirtualFreeEx(hProc, loc, 0, MEM_RELEASE);
-            CloseHandle(hProc);
-            return 1;
-        }
+        WriteProcessMemory(hProc, loc, dllPath, wcslen(dllPath) * 2 + 2, 0); // length * 2 for bytes + 2 for end string
 
-        // Start a remote thread that calls LoadLibraryW with the DLL path
-        HANDLE hThread = CreateRemoteThread(hProc, 0, 0, (LPTHREAD_START_ROUTINE)LoadLibraryW, loc, 0, 0);
+        HANDLE hThread = CreateRemoteThread(hProc, 0, 0, (LPTHREAD_START_ROUTINE)LoadLibraryW, loc, 0, 0); // using LoadLibraryW instead of LoadLibraryA to allow wchar
 
-        if (hThread) {
-            // Wait for the thread to finish executing LoadLibraryW
-            WaitForSingleObject(hThread, INFINITE);
+        if (hThread)
+        {
             CloseHandle(hThread);
-        } else {
-            std::cerr << "Error: Failed to create remote thread (Error: " << GetLastError() << ")" << std::endl;
-            VirtualFreeEx(hProc, loc, 0, MEM_RELEASE);
-            CloseHandle(hProc);
-            return 1;
         }
-        
-        // Clean up the allocated memory
-        VirtualFreeEx(hProc, loc, 0, MEM_RELEASE);
-        CloseHandle(hProc);
-    } else {
-        std::cerr << "Error: Failed to open process (Error: " << GetLastError() << "). Try running as administrator." << std::endl;
-        return 1;
     }
-    
+    if (hProc)
+    {
+        CloseHandle(hProc);
+    }
     return 0;
 }
 
 int main(int argc, char* argv[]) {
+    // Check Admin rights
+    BOOL fIsRunAsAdmin = FALSE;
+    PSID pAdministratorsGroup = NULL;
+    SID_IDENTIFIER_AUTHORITY NtAuthority = SECURITY_NT_AUTHORITY;
+    if (AllocateAndInitializeSid(
+        &NtAuthority, 2,
+        SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
+        0, 0, 0, 0, 0, 0, &pAdministratorsGroup))
+    {
+        CheckTokenMembership(NULL, pAdministratorsGroup, &fIsRunAsAdmin);
+        FreeSid(pAdministratorsGroup);
+    }
+
+    if (!fIsRunAsAdmin) {
+        char szPath[MAX_PATH];
+        if (GetModuleFileNameA(NULL, szPath, ARRAYSIZE(szPath))) {
+            std::string args = "";
+            for (int i = 1; i < argc; i++) {
+                args += "\"";
+                args += argv[i];
+                args += "\" ";
+            }
+            
+            SHELLEXECUTEINFOA sei = { sizeof(sei) };
+            sei.fMask = SEE_MASK_NOCLOSEPROCESS;
+            sei.lpVerb = "runas";
+            sei.lpFile = szPath;
+            sei.lpParameters = args.c_str();
+            sei.hwnd = NULL;
+            sei.nShow = SW_SHOWNORMAL; // Ensure it opens not fullscreen
+            
+            if (ShellExecuteExA(&sei)) {
+                // Wait for the elevated process to finish if needed, or just exit.
+                // We'll just exit so the launcher doesn't hang waiting if it doesn't need to.
+                return 0; 
+            }
+        }
+        std::cerr << "Failed to elevate privileges." << std::endl;
+        return 1;
+    }
+
     // Set console title
     SetConsoleTitleA("MaraInjector");
+
+    // Make sure it's not fullscreen by restoring the window
+    HWND consoleWindow = GetConsoleWindow();
+    if (consoleWindow) {
+        ShowWindow(consoleWindow, SW_SHOWNORMAL);
+    }
 
     if (argc != 3) {
         std::cout << "MaraInjector" << std::endl;
@@ -105,7 +131,7 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Convert dllPath to wchar_t for LoadLibraryW
+    // Convert dllPath to wchar_t for performInjection
     int len = MultiByteToWideChar(CP_ACP, 0, dllPath, -1, NULL, 0);
     std::vector<wchar_t> wDllPath(len);
     MultiByteToWideChar(CP_ACP, 0, dllPath, -1, wDllPath.data(), len);

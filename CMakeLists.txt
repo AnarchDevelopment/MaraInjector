@@ -10,7 +10,7 @@ add_definitions(-DUNICODE -D_UNICODE)
 add_executable(mara mara.cpp)
 
 # Link against common Windows libraries
-target_link_libraries(mara kernel32 user32)
+target_link_libraries(mara kernel32 user32 shell32 advapi32)
 
 set_target_properties(mara PROPERTIES 
     OUTPUT_NAME "mara"
