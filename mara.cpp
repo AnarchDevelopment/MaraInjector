@@ -1,10 +1,74 @@
 #define _CRT_SECURE_NO_WARNINGS
 #include <windows.h>
 #include <TlHelp32.h>
-#include <shellapi.h>
 #include <iostream>
 #include <string>
 #include <vector>
+#include <AclApi.h>
+#include <Sddl.h>
+
+// Based on Wunkolo's UWPDumper:
+// https://github.com/Wunkolo/UWPDumper/blob/9fb0a040e674521c1413276bcea6e4e708f34d19/UWPInjector/source/main.cpp#L226
+void SetAccessControl(std::wstring& ExecutableName, const wchar_t* AccessString)
+{
+    PSECURITY_DESCRIPTOR SecurityDescriptor = nullptr;
+    EXPLICIT_ACCESSW ExplicitAccess = { 0 };
+
+    ACL* AccessControlCurrent = nullptr;
+    ACL* AccessControlNew = nullptr;
+
+    SECURITY_INFORMATION SecurityInfo = DACL_SECURITY_INFORMATION;
+    PSID SecurityIdentifier = nullptr;
+
+    if (GetNamedSecurityInfoW(
+        ExecutableName.c_str(),
+        SE_FILE_OBJECT,
+        DACL_SECURITY_INFORMATION,
+        nullptr,
+        nullptr,
+        &AccessControlCurrent,
+        nullptr,
+        &SecurityDescriptor
+    ) == ERROR_SUCCESS)
+    {
+        ConvertStringSidToSidW(AccessString, &SecurityIdentifier);
+        if (SecurityIdentifier != nullptr)
+        {
+            ExplicitAccess.grfAccessPermissions = GENERIC_READ | GENERIC_EXECUTE;
+            ExplicitAccess.grfAccessMode = SET_ACCESS;
+            ExplicitAccess.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+            ExplicitAccess.Trustee.TrusteeForm = TRUSTEE_IS_SID;
+            ExplicitAccess.Trustee.TrusteeType = TRUSTEE_IS_WELL_KNOWN_GROUP;
+            ExplicitAccess.Trustee.ptstrName = reinterpret_cast<wchar_t*>(SecurityIdentifier);
+
+            if (SetEntriesInAclW(
+                1,
+                &ExplicitAccess,
+                AccessControlCurrent,
+                &AccessControlNew
+            ) == ERROR_SUCCESS)
+            {
+                SetNamedSecurityInfoW(
+                    const_cast<wchar_t*>(ExecutableName.c_str()),
+                    SE_FILE_OBJECT,
+                    SecurityInfo,
+                    nullptr,
+                    nullptr,
+                    AccessControlNew,
+                    nullptr
+                );
+            }
+        }
+    }
+    if (SecurityDescriptor)
+    {
+        LocalFree(reinterpret_cast<HLOCAL>(SecurityDescriptor));
+    }
+    if (AccessControlNew)
+    {
+        LocalFree(reinterpret_cast<HLOCAL>(AccessControlNew));
+    }
+}
 
 DWORD GetProcId(const char *procName)
 {
@@ -59,55 +123,8 @@ int performInjection(DWORD procId, const wchar_t *dllPath)
 }
 
 int main(int argc, char* argv[]) {
-    // Check Admin rights
-    BOOL fIsRunAsAdmin = FALSE;
-    PSID pAdministratorsGroup = NULL;
-    SID_IDENTIFIER_AUTHORITY NtAuthority = SECURITY_NT_AUTHORITY;
-    if (AllocateAndInitializeSid(
-        &NtAuthority, 2,
-        SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
-        0, 0, 0, 0, 0, 0, &pAdministratorsGroup))
-    {
-        CheckTokenMembership(NULL, pAdministratorsGroup, &fIsRunAsAdmin);
-        FreeSid(pAdministratorsGroup);
-    }
-
-    if (!fIsRunAsAdmin) {
-        char szPath[MAX_PATH];
-        if (GetModuleFileNameA(NULL, szPath, ARRAYSIZE(szPath))) {
-            std::string args = "";
-            for (int i = 1; i < argc; i++) {
-                args += "\"";
-                args += argv[i];
-                args += "\" ";
-            }
-            
-            SHELLEXECUTEINFOA sei = { sizeof(sei) };
-            sei.fMask = SEE_MASK_NOCLOSEPROCESS;
-            sei.lpVerb = "runas";
-            sei.lpFile = szPath;
-            sei.lpParameters = args.c_str();
-            sei.hwnd = NULL;
-            sei.nShow = SW_SHOWNORMAL; // Ensure it opens not fullscreen
-            
-            if (ShellExecuteExA(&sei)) {
-                // Wait for the elevated process to finish if needed, or just exit.
-                // We'll just exit so the launcher doesn't hang waiting if it doesn't need to.
-                return 0; 
-            }
-        }
-        std::cerr << "Failed to elevate privileges." << std::endl;
-        return 1;
-    }
-
     // Set console title
     SetConsoleTitleA("MaraInjector");
-
-    // Make sure it's not fullscreen by restoring the window
-    HWND consoleWindow = GetConsoleWindow();
-    if (consoleWindow) {
-        ShowWindow(consoleWindow, SW_SHOWNORMAL);
-    }
 
     if (argc != 3) {
         std::cout << "MaraInjector" << std::endl;
@@ -131,28 +148,29 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
-    // Convert dllPath to wchar_t for performInjection
+    // Convert dllPath to wchar_t for SetAccessControl and performInjection
     int len = MultiByteToWideChar(CP_ACP, 0, dllPath, -1, NULL, 0);
-    std::vector<wchar_t> wDllPath(len);
-    MultiByteToWideChar(CP_ACP, 0, dllPath, -1, wDllPath.data(), len);
+    std::vector<wchar_t> wDllPathVec(len);
+    MultiByteToWideChar(CP_ACP, 0, dllPath, -1, wDllPathVec.data(), len);
 
-    // Get full path of DLL if possible
+    // Get full path of DLL
     wchar_t fullPath[MAX_PATH];
-    if (GetFullPathNameW(wDllPath.data(), MAX_PATH, fullPath, NULL)) {
-        std::wcout << L"Injecting: " << fullPath << L" into " << processName << L" (PID: " << procId << L")..." << std::endl;
-        if (performInjection(procId, fullPath) == 0) {
-            std::cout << "Successfully injected!" << std::endl;
-        } else {
-            return 1;
-        }
-    } else {
-        std::wcout << L"Injecting: " << wDllPath.data() << L" into " << processName << L" (PID: " << procId << L")..." << std::endl;
-        if (performInjection(procId, wDllPath.data()) == 0) {
-            std::cout << "Successfully injected!" << std::endl;
-        } else {
-            return 1;
-        }
+    const wchar_t* finalPath = wDllPathVec.data();
+    if (GetFullPathNameW(wDllPathVec.data(), MAX_PATH, fullPath, NULL)) {
+        finalPath = fullPath;
     }
+
+    std::wstring wStrPath(finalPath);
+
+    std::wcout << L"Injecting: " << wStrPath << L" into " << processName << L" (PID: " << procId << L")..." << std::endl;
+
+    // Grant UWP app container (ALL_APP_PACKAGES) read+execute access to the DLL
+    // SID S-1-15-2-1 = ALL_APPLICATION_PACKAGES (required for Minecraft UWP)
+    SetAccessControl(wStrPath, L"S-1-15-2-1");
+
+    performInjection(procId, wStrPath.c_str());
+
+    std::cout << "Successfully injected!" << std::endl;
 
     return 0;
 }
